@@ -749,7 +749,7 @@ class OptimizedCadastralAnonymizer:
         except:
             return 'Normal'
 
-    def optimized_k_anonymity(self, k: int = 5) -> gpd.GeoDataFrame:
+    def optimized_k_anonymity_k_means(self, k: int = 5) -> gpd.GeoDataFrame:
         """
         K-anonymity with proper error handling
         """
@@ -851,6 +851,136 @@ class OptimizedCadastralAnonymizer:
             
         except Exception as e:
             print(f"Error in k-anonymity: {e}")
+            return gpd.GeoDataFrame(columns=self.gdf.columns, crs=self.gdf.crs)
+        
+        
+    def optimized_k_anonymity(self, k: int = 5) -> gpd.GeoDataFrame:
+        """
+        K-anonymity via DBSCAN density-based clustering.
+        
+        Uses adaptive epsilon derived from k-nearest neighbor distances 
+        (eps = 3 * median(k-NN distances)), with min_samples=k to enforce 
+        the k-anonymity threshold. Clusters are merged into unified 
+        polygons via unary_union; outlier parcels (DBSCAN noise, label=-1) 
+        are handled separately and excluded from the anonymized output 
+        to prevent singleton re-identification.
+        """
+        print(f"Applying k-anonymity via DBSCAN clustering with k={k}")
+        
+        if len(self.gdf) < k:
+            print(f"Warning: Not enough data points ({len(self.gdf)}) for k={k}")
+            return gpd.GeoDataFrame(columns=self.gdf.columns, crs=self.gdf.crs)
+        
+        try:
+            # Use spatial coordinates (centroids) for density-based clustering
+            # DBSCAN operates on spatial proximity, so centroid_x/y are the 
+            # natural feature space — not attribute features like flaecheAmtlich
+            if 'centroid_x' not in self.gdf.columns or 'centroid_y' not in self.gdf.columns:
+                print("Warning: centroid_x/centroid_y not available; cannot cluster spatially")
+                return gpd.GeoDataFrame(columns=self.gdf.columns, crs=self.gdf.crs)
+            
+            coords = self.gdf[['centroid_x', 'centroid_y']].fillna(0).values
+            
+            # Derive adaptive epsilon from k-nearest neighbor distances
+            # Rationale: eps should be large enough to capture typical 
+            # k-neighborhoods but small enough to preserve local spatial 
+            # structure. We use 3 * median(k-NN distance) as a robust 
+            # heuristic following Ester et al. (1996).
+            from scipy.spatial import cKDTree
+            tree = cKDTree(coords)
+            # Query k+1 because the nearest neighbor of each point is itself
+            knn_distances, _ = tree.query(coords, k=k + 1)
+            # Take the distance to the k-th true neighbor (index k, excluding self at index 0)
+            kth_distances = knn_distances[:, k]
+            eps_distance = float(np.median(kth_distances) * 3)
+            print(f"Adaptive DBSCAN eps: {eps_distance:.1f}m (from 3 * median k-NN distance)")
+            
+            # Run DBSCAN with min_samples=k to enforce the k-anonymity threshold
+            clustering = DBSCAN(eps=eps_distance, min_samples=k).fit(coords)
+            labels = clustering.labels_
+            
+            self.gdf['cluster_id'] = labels
+            
+            n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+            n_noise = int(np.sum(labels == -1))
+            print(f"DBSCAN produced {n_clusters} clusters; {n_noise} parcels flagged as noise (outliers)")
+            
+            # Create cluster representatives (exclude noise, label == -1)
+            anonymized_data = []
+            for cluster_id in np.unique(labels):
+                if cluster_id == -1:
+                    # Noise points cannot satisfy k-anonymity; drop them
+                    # rather than releasing singleton records
+                    continue
+                
+                cluster_mask = labels == cluster_id
+                cluster_polygons = self.gdf[cluster_mask]
+                
+                # Defensive: DBSCAN guarantees >= min_samples, but check anyway
+                if len(cluster_polygons) < k:
+                    continue
+                
+                # Calculate cluster statistics
+                total_area = cluster_polygons.get('flaecheAmtlich', pd.Series([0])).sum()
+                if total_area == 0:
+                    total_area = cluster_polygons.geometry.area.sum()
+                
+                # Create generalized geometry via unary union (preserves true footprint
+                # of k merged parcels) with convex hull fallback for robustness
+                try:
+                    geometries = cluster_polygons.geometry.tolist()
+                    cluster_union = unary_union(geometries)
+                    
+                    # Use convex hull to smooth the merged boundary
+                    if hasattr(cluster_union, 'convex_hull'):
+                        representative_geom = cluster_union.convex_hull
+                    else:
+                        representative_geom = cluster_union
+                        
+                except Exception as e:
+                    print(f"Warning: Using first geometry for cluster {cluster_id}: {e}")
+                    representative_geom = cluster_polygons.geometry.iloc[0]
+                
+                # Get most common land type
+                land_type = 'mixed'
+                if 'flaechentyp' in cluster_polygons.columns:
+                    mode_series = cluster_polygons['flaechentyp'].mode()
+                    if len(mode_series) > 0:
+                        land_type = mode_series.iloc[0]
+                
+                cluster_data = {
+                    'cluster_id': int(cluster_id),
+                    'geometry': representative_geom,
+                    'member_count': len(cluster_polygons),
+                    'total_area': total_area,
+                    'flaechentyp': land_type,
+                    'privacy_method': 'k_anonymity',
+                    'k_value': len(cluster_polygons)
+                }
+                
+                anonymized_data.append(cluster_data)
+            
+            result_gdf = gpd.GeoDataFrame(anonymized_data, crs=self.gdf.crs)
+            
+            # Calculate metrics
+            if len(result_gdf) > 0:
+                achieved_k = min([row['member_count'] for _, row in result_gdf.iterrows()])
+                self.privacy_metrics['k_anonymity'] = {
+                    'achieved_k': achieved_k,
+                    'target_k': k,
+                    'num_clusters': len(result_gdf),
+                    'num_noise_points': n_noise,
+                    'eps_distance': eps_distance,
+                    'privacy_satisfied': achieved_k >= k,
+                    'clustering_algorithm': 'DBSCAN'
+                }
+            
+            return result_gdf
+            
+        except Exception as e:
+            print(f"Error in k-anonymity: {e}")
+            import traceback
+            traceback.print_exc()
             return gpd.GeoDataFrame(columns=self.gdf.columns, crs=self.gdf.crs)
 
     def conservative_geo_indistinguishability(self, epsilon: float = 2.0) -> gpd.GeoDataFrame:
